@@ -25,6 +25,7 @@ base64 = "0.11.0"
 terminfo = "0.7.1"
 url = "2"
 copypasta = { version = "0.7.0", default-features = false }
+image = "0.21.0"
 
 [target.'cfg(unix)'.dependencies]
 nix = "0.17.0"

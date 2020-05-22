@@ -180,6 +180,13 @@ impl Display {
         // Create renderer.
         let mut renderer = QuadRenderer::new()?;
 
+        if let Some(path) = &config.background_image {
+            match renderer.set_background_image(path) {
+                Ok(_) => (),
+                Err(err) => info!("Cannot set background image: {}", err),
+            }
+        }
+
         let (glyph_cache, cell_width, cell_height) =
             Self::new_glyph_cache(dpr, &mut renderer, config)?;
 
@@ -434,6 +441,7 @@ impl Display {
         self.renderer.with_api(&config, &size_info, |api| {
             api.clear(background_color);
         });
+        self.renderer.draw_image( config.background_opacity(), &size_info);
 
         let mut lines = RenderLines::new();
         let mut urls = Urls::new();

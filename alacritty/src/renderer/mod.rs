@@ -16,7 +16,7 @@ use std::fs;
 use std::hash::BuildHasherDefault;
 use std::io;
 use std::mem::size_of;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::mpsc;
 use std::time::Duration;
@@ -26,6 +26,8 @@ use font::{
     self, BitmapBuffer, FontDesc, FontKey, GlyphKey, Rasterize, RasterizedGlyph, Rasterizer,
 };
 use log::{error, info};
+use glutin::dpi::PhysicalSize;
+use image::{self, GenericImageView};
 use notify::{watcher, DebouncedEvent, RecursiveMode, Watcher};
 
 use crate::cursor;
@@ -47,6 +49,8 @@ static TEXT_SHADER_F_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/t
 static TEXT_SHADER_V_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/text.v.glsl");
 static RECT_SHADER_F_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/rect.f.glsl");
 static RECT_SHADER_V_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/rect.v.glsl");
+static IMAGE_SHADER_F_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/image.f.glsl");
+static IMAGE_SHADER_V_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../res/image.v.glsl");
 
 // Shader source which is used when live-shader-reload feature is disable.
 static TEXT_SHADER_F: &str =
@@ -57,6 +61,10 @@ static RECT_SHADER_F: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../res/rect.f.glsl"));
 static RECT_SHADER_V: &str =
     include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../res/rect.v.glsl"));
+static IMAGE_SHADER_F: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../res/image.f.glsl"));
+static IMAGE_SHADER_V: &str =
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../res/image.v.glsl"));
 
 /// `LoadGlyph` allows for copying a rasterized glyph into graphics memory.
 pub trait LoadGlyph {
@@ -131,6 +139,15 @@ pub struct RectShaderProgram {
     id: GLuint,
     /// Rectangle color.
     u_color: GLint,
+}
+
+/// Image drawing program
+///
+/// Uniforms are prefixed with "u"
+#[derive(Debug)]
+pub struct ImageShaderProgram {
+    // Program id
+    id: GLuint,
 }
 
 #[derive(Copy, Debug, Clone)]
@@ -426,11 +443,17 @@ struct InstanceData {
 pub struct QuadRenderer {
     program: TextShaderProgram,
     rect_program: RectShaderProgram,
+    image_program: ImageShaderProgram,
     vao: GLuint,
     ebo: GLuint,
     vbo_instance: GLuint,
     rect_vao: GLuint,
     rect_vbo: GLuint,
+    image_vao: GLuint,
+    image_vbo: GLuint,
+    image_vbo_tex: GLuint,
+    bg_tex: GLuint,
+    image_loaded: bool,
     atlas: Vec<Atlas>,
     current_atlas: usize,
     active_tex: GLuint,
@@ -453,6 +476,12 @@ pub struct LoaderApi<'a> {
     active_tex: &'a mut GLuint,
     atlas: &'a mut Vec<Atlas>,
     current_atlas: &'a mut usize,
+}
+
+#[derive(Debug)]
+pub struct PackedVertex {
+    x: f32,
+    y: f32,
 }
 
 #[derive(Debug, Default)]
@@ -537,6 +566,7 @@ impl QuadRenderer {
     pub fn new() -> Result<QuadRenderer, Error> {
         let program = TextShaderProgram::new()?;
         let rect_program = RectShaderProgram::new()?;
+        let image_program = ImageShaderProgram::new()?;
 
         let mut vao: GLuint = 0;
         let mut ebo: GLuint = 0;
@@ -546,6 +576,11 @@ impl QuadRenderer {
         let mut rect_vao: GLuint = 0;
         let mut rect_vbo: GLuint = 0;
         let mut rect_ebo: GLuint = 0;
+
+        let mut image_vao: GLuint = 0;
+        let mut image_vbo: GLuint = 0;
+        let mut image_vbo_tex: GLuint = 0;
+        let mut bg_tex: GLuint = 0;
 
         unsafe {
             gl::Enable(gl::BLEND);
@@ -664,6 +699,76 @@ impl QuadRenderer {
                 gl::STATIC_DRAW,
             );
 
+            gl::BindVertexArray(0);
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
+
+            // Image setup
+            gl::GenVertexArrays(1, &mut image_vao);
+            gl::GenBuffers(1, &mut image_vbo);
+            gl::GenBuffers(1, &mut image_vbo_tex);
+            gl::BindVertexArray(image_vao);
+            //pos
+            let vertices = [
+                PackedVertex { x: -1.0, y: -1.0 },
+                PackedVertex { x: 1.0, y: -1.0 },
+                PackedVertex { x: 1.0, y: 1.0 },
+                PackedVertex { x: -1.0, y: 1.0 },
+            ];
+            gl::BindBuffer(gl::ARRAY_BUFFER, image_vbo);
+
+            gl::VertexAttribPointer(
+                0,
+                2,
+                gl::FLOAT,
+                gl::FALSE,
+                size_of::<PackedVertex>() as i32,
+                ptr::null(),
+            );
+            gl::EnableVertexAttribArray(0);
+
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (size_of::<PackedVertex>() * vertices.len()) as GLsizeiptr,
+                vertices.as_ptr() as *const _,
+                gl::STATIC_DRAW,
+            );
+            //texCoord
+            let vertices = [
+                PackedVertex { x: 0.0, y: 1.0 },
+                PackedVertex { x: 1.0, y: 1.0 },
+                PackedVertex { x: 1.0, y: 0.0 },
+                PackedVertex { x: 0.0, y: 0.0 },
+            ];
+
+            gl::BindBuffer(gl::ARRAY_BUFFER, image_vbo_tex);
+
+            gl::VertexAttribPointer(
+                1,
+                2,
+                gl::FLOAT,
+                gl::FALSE,
+                size_of::<PackedVertex>() as i32,
+                ptr::null(),
+            );
+            gl::EnableVertexAttribArray(1);
+
+            gl::BufferData(
+                gl::ARRAY_BUFFER,
+                (size_of::<PackedVertex>() * vertices.len()) as GLsizeiptr,
+                vertices.as_ptr() as *const _,
+                gl::STATIC_DRAW,
+            );
+
+            // Texture
+            gl::GenTextures(1, &mut bg_tex);
+            gl::BindTexture(gl::TEXTURE_2D, bg_tex);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::REPEAT as i32); // set texture wrapping to gl::REPEAT (default wrapping method)
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::REPEAT as i32);
+            // set texture filtering parameters
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+
             // Cleanup.
             gl::BindVertexArray(0);
             gl::BindBuffer(gl::ARRAY_BUFFER, 0);
@@ -704,11 +809,17 @@ impl QuadRenderer {
         let mut renderer = Self {
             program,
             rect_program,
+            image_program,
             vao,
             ebo,
             vbo_instance,
             rect_vao,
             rect_vbo,
+            image_vao,
+            image_vbo,
+            image_vbo_tex,
+            bg_tex,
+            image_loaded: false,
             atlas: Vec::new(),
             current_atlas: 0,
             active_tex: 0,
@@ -720,6 +831,51 @@ impl QuadRenderer {
         renderer.atlas.push(atlas);
 
         Ok(renderer)
+    }
+
+        pub fn set_background_image(&mut self, path: &PathBuf) -> Result<(), image::ImageError> {
+        let img = match image::open(&Path::new(path)) {
+            Ok(content) => content,
+            Err(err) => {
+                self.image_loaded = false;
+                return Err(err);
+            }
+        };
+        unsafe {
+            gl::BindVertexArray(self.image_vao);
+            gl::BindBuffer(gl::ARRAY_BUFFER, self.image_vbo_tex);
+
+            // Texture
+            gl::GenTextures(1, &mut self.bg_tex);
+            gl::BindTexture(gl::TEXTURE_2D, self.bg_tex);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_S, gl::REPEAT as i32); // set texture wrapping to gl::REPEAT (default wrapping method)
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_WRAP_T, gl::REPEAT as i32);
+            // set texture filtering parameters
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MIN_FILTER, gl::LINEAR as i32);
+            gl::TexParameteri(gl::TEXTURE_2D, gl::TEXTURE_MAG_FILTER, gl::LINEAR as i32);
+
+            let data = img.to_rgba().into_raw();
+            gl::TexImage2D(
+                gl::TEXTURE_2D,
+                0,
+                gl::RGBA as i32,
+                img.width() as i32,
+                img.height() as i32,
+                0,
+                gl::RGBA,
+                gl::UNSIGNED_BYTE,
+                &data[0] as *const u8 as *const _,
+            );
+            gl::GenerateMipmap(gl::TEXTURE_2D);
+
+            // Cleanup
+            gl::BindVertexArray(0);
+            gl::BindBuffer(gl::ARRAY_BUFFER, 0);
+            gl::BindBuffer(gl::ELEMENT_ARRAY_BUFFER, 0);
+        }
+
+        self.image_loaded = true;
+        Ok(())
     }
 
     /// Draw all rectangles simultaneously to prevent excessive program swaps.
@@ -833,9 +989,10 @@ impl QuadRenderer {
 
     pub fn reload_shaders(&mut self, props: &term::SizeInfo) {
         info!("Reloading shaders...");
-        let result = (TextShaderProgram::new(), RectShaderProgram::new());
-        let (program, rect_program) = match result {
-            (Ok(program), Ok(rect_program)) => {
+        let result =
+            (TextShaderProgram::new(), RectShaderProgram::new(), ImageShaderProgram::new());
+        let (program, rect_program, image_program) = match result {
+            (Ok(program), Ok(rect_program), Ok(image_program)) => {
                 unsafe {
                     gl::UseProgram(program.id);
                     program.update_projection(
@@ -848,9 +1005,9 @@ impl QuadRenderer {
                 }
 
                 info!("... successfully reloaded shaders");
-                (program, rect_program)
-            },
-            (Err(err), _) | (_, Err(err)) => {
+                (program, rect_program, image_program)
+            }
+            (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
                 error!("{}", err);
                 return;
             },
@@ -859,6 +1016,7 @@ impl QuadRenderer {
         self.active_tex = 0;
         self.program = program;
         self.rect_program = rect_program;
+        self.image_program = image_program;
     }
 
     pub fn resize(&mut self, size: &SizeInfo) {
@@ -912,6 +1070,59 @@ impl QuadRenderer {
 
             // Draw the rectangle.
             gl::DrawElements(gl::TRIANGLES, 6, gl::UNSIGNED_INT, ptr::null());
+        }
+    }
+
+    // Render a image
+    //   pub fn with_api<F, T, C>(&mut self, config: &Config<C>, props: &term::SizeInfo, func: F) -> T
+    // This requires the image program to be activated
+    pub fn draw_image(&mut self, alpha: f32, props: &term::SizeInfo) {
+        // Do nothing when image has not been loaded
+        if !self.image_loaded {
+            return;
+        }
+        // Do nothing when alpha is fully transparent
+        if alpha == 0. {
+            return;
+        }
+
+        unsafe {
+            // Swap program
+            gl::UseProgram(self.image_program.id);
+
+            // Remove padding from viewport
+            gl::Viewport(0, 0, props.width as i32, props.height as i32);
+
+            // Change blending strategy
+            gl::BlendFunc(gl::SRC_ALPHA, gl::ONE_MINUS_SRC_ALPHA);
+
+            // Setup data and buffers
+            gl::BindVertexArray(self.image_vao);
+
+            // Setup texture
+            gl::BindTexture(gl::TEXTURE_2D, self.bg_tex);
+
+            // Draw the rectangle
+            gl::DrawArrays(gl::TRIANGLE_FAN, 0, 4);
+        }
+
+        // Deactivate image program again
+        unsafe {
+            // Reset blending strategy
+            gl::BlendFunc(gl::SRC1_COLOR, gl::ONE_MINUS_SRC1_COLOR);
+
+            // Reset data and buffers
+            gl::BindVertexArray(0);
+            self.active_tex = 0;
+
+            let padding_x = props.padding_x as i32;
+            let padding_y = props.padding_y as i32;
+            let width = props.width as i32;
+            let height = props.height as i32;
+            gl::Viewport(padding_x, padding_y, width - 2 * padding_x, height - 2 * padding_y);
+
+            // Disable program
+            gl::UseProgram(0);
         }
     }
 }
@@ -1307,6 +1518,40 @@ impl RectShaderProgram {
 }
 
 impl Drop for RectShaderProgram {
+    fn drop(&mut self) {
+        unsafe {
+            gl::DeleteProgram(self.id);
+        }
+    }
+}
+
+impl ImageShaderProgram {
+    pub fn new() -> Result<Self, ShaderCreationError> {
+        let (vertex_src, fragment_src) = if cfg!(feature = "live-shader-reload") {
+            (None, None)
+        } else {
+            (Some(IMAGE_SHADER_V), Some(IMAGE_SHADER_F))
+        };
+        let vertex_shader = create_shader(IMAGE_SHADER_V_PATH, gl::VERTEX_SHADER, vertex_src)?;
+        let fragment_shader =
+            create_shader(IMAGE_SHADER_F_PATH, gl::FRAGMENT_SHADER, fragment_src)?;
+        let program = create_program(vertex_shader, fragment_shader)?;
+
+        unsafe {
+            gl::DeleteShader(fragment_shader);
+            gl::DeleteShader(vertex_shader);
+            gl::UseProgram(program);
+        }
+
+        let shader = ImageShaderProgram { id: program };
+
+        unsafe { gl::UseProgram(0) }
+
+        Ok(shader)
+    }
+}
+
+impl Drop for ImageShaderProgram {
     fn drop(&mut self) {
         unsafe {
             gl::DeleteProgram(self.id);
